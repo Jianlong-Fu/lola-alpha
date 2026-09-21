@@ -70,7 +70,7 @@ Each run writes `results_all.json`, `summary_metrics.json` and
 
 ## Results
 
-Evaluated with `lola-alpha-calvin-abc-d-bf16.safetensors`, one GPU
+Evaluated with [`lola-alpha-calvin-abc-d-bf16.safetensors`](https://github.com/Jianlong-Fu/lola-alpha/releases/tag/model-v1.0.0), one GPU
 per run, 1000 sequences per seed and a 360-step limit per subtask. Inference
 uses 3 integration steps and executes 8 actions per prediction. Scores are
 the mean number of completed tasks per sequence (maximum 5).
