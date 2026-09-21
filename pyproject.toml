@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools==80.10.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lola-alpha"
+version = "0.1.0"
+description = "Fixed LoLA-alpha model inference and CALVIN evaluation"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+license = {file = "LICENSE"}
+dependencies = [
+    "torch==2.11.0",
+    "torchvision==0.26.0",
+    "transformers==5.14.1",
+    "diffusers==0.37.0",
+    "safetensors==0.8.0",
+    "numpy==1.26.4",
+    "Pillow==12.3.0",
+]
+
+[project.optional-dependencies]
+eval = [
+    "hydra-core==1.3.7", "omegaconf==2.3.1", "hydra-colorlog==1.2.0",
+    "fnvhash==0.2.1",
+    "gym==0.23.1", "pybullet==3.2.7", "opencv-python==4.11.0.86",
+    "numpy-quaternion==2024.0.13", "scipy==1.17.1", "numba==0.67.0",
+    "gitpython==3.1.62", "rich==15.0.0", "setuptools==80.10.2",
+]
+export = ["deepspeed>=0.16"]
+
+[project.scripts]
+lola-alpha-eval = "eval_on_lola_07_summary_torchrun:main"
+lola-alpha-export = "export_checkpoint:main"
+
+[tool.setuptools]
+packages = ["lola_alpha"]
+py-modules = ["eval_on_lola_07_summary_torchrun", "export_checkpoint"]
