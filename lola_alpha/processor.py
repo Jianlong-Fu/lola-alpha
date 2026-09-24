@@ -1,6 +1,8 @@
 """LoLA preprocessing, modified for standalone inference. Original notices: LICENSE."""
 
 from collections import deque
+from dataclasses import dataclass, fields
+import json
 
 import numpy as np
 from PIL import Image
@@ -25,14 +27,54 @@ ACTION_STD = (
 )
 
 
-def normalize_state(raw_state):
+@dataclass(frozen=True)
+class NormalizationStats:
+    state_mean: tuple[float, ...] = STATE_MEAN
+    state_std: tuple[float, ...] = STATE_STD
+    action_mean: tuple[float, ...] = ACTION_MEAN
+    action_std: tuple[float, ...] = ACTION_STD
+
+    def __post_init__(self):
+        for field in fields(self):
+            try:
+                values = np.asarray(getattr(self, field.name), dtype=np.float64)
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"Invalid normalization {field.name}: expected 7 finite numbers") from error
+            if values.shape != (7,) or not np.isfinite(values).all():
+                raise ValueError(f"Invalid normalization {field.name}: expected 7 finite numbers")
+            if field.name.endswith("_std") and (values <= 0).any():
+                raise ValueError(f"Invalid normalization {field.name}: standard deviations must be positive")
+            object.__setattr__(self, field.name, tuple(float(value) for value in values))
+
+    @classmethod
+    def from_metadata(cls, metadata):
+        """Read the normalization JSON; absent fields retain the legacy defaults."""
+        serialized = (metadata or {}).get("normalization")
+        if serialized is None:
+            return cls()
+        try:
+            payload = json.loads(serialized)
+        except (TypeError, json.JSONDecodeError) as error:
+            raise ValueError("Invalid normalization metadata: expected a JSON object") from error
+        if not isinstance(payload, dict):
+            raise ValueError("Invalid normalization metadata: expected a JSON object")
+        unknown = set(payload) - {field.name for field in fields(cls)}
+        if unknown:
+            raise ValueError(f"Unknown normalization fields: {sorted(unknown)}")
+        return cls(**payload)
+
+
+DEFAULT_NORMALIZATION = NormalizationStats()
+
+
+def normalize_state(raw_state, normalization=DEFAULT_NORMALIZATION):
     state = torch.as_tensor(raw_state, dtype=torch.float32).detach().cpu().reshape(-1)[:7]
-    return (state - state.new_tensor(STATE_MEAN)) / (state.new_tensor(STATE_STD) + 1e-8)
+    return (state - state.new_tensor(normalization.state_mean)) / (state.new_tensor(normalization.state_std) + 1e-8)
 
 
-def unnormalize_actions(actions):
-    mean = torch.tensor(ACTION_MEAN, device=actions.device, dtype=torch.float32)
-    std = torch.tensor(ACTION_STD, device=actions.device, dtype=torch.float32)
+def unnormalize_actions(actions, normalization=DEFAULT_NORMALIZATION):
+    mean = torch.tensor(normalization.action_mean, device=actions.device, dtype=torch.float32)
+    std = torch.tensor(normalization.action_std, device=actions.device, dtype=torch.float32)
     output = actions * std + mean
     output[..., -1] = actions[..., -1].to(output.dtype)
     return output
@@ -54,9 +96,10 @@ def append_empty_token(batch):
 
 
 class Processor:
-    def __init__(self, vlm_path, device):
+    def __init__(self, vlm_path, device, normalization=DEFAULT_NORMALIZATION):
         from transformers import AutoProcessor
 
+        self.normalization = normalization
         self.device = torch.device(device)
         self.processor = AutoProcessor.from_pretrained(str(vlm_path), local_files_only=True)
         image_processor = self.processor.image_processor
@@ -86,13 +129,14 @@ class Processor:
             "input_ids", "attention_mask", "pixel_values", "image_grid_thw", "mm_token_type_ids",
         ) if key in encoded})
         batch = {key: value.to(self.device) for key, value in batch.items()}
-        batch["observation.state"] = normalize_state(observation["robot_obs"]).unsqueeze(0).to(self.device)
+        batch["observation.state"] = normalize_state(observation["robot_obs"], self.normalization).unsqueeze(0).to(self.device)
         batch.update(history.build(self.device))
         return batch
 
 
 class SummaryHistory:
-    def __init__(self, null_state):
+    def __init__(self, null_state, normalization=DEFAULT_NORMALIZATION):
+        self.normalization = normalization
         self.null = null_state.detach().float().cpu()
         self.transition = deque(maxlen=32)
         self.task = deque(maxlen=32)
@@ -106,11 +150,11 @@ class SummaryHistory:
         self.completed = []
 
     def begin_subtask(self, raw_state):
-        self.task.append(normalize_state(raw_state))
+        self.task.append(normalize_state(raw_state, self.normalization))
         self.task_length = 1
 
     def record_nonterminal_state(self, raw_state):
-        self.task.append(normalize_state(raw_state))
+        self.task.append(normalize_state(raw_state, self.normalization))
         self.task_length += 1
 
     def complete_subtask(self, annotation):

@@ -40,7 +40,7 @@ def rollout(env, policy, processor, history, task_oracle, subtask, annotation, e
         if not actions:
             batch = processor(observation, annotation, history)
             predicted = policy.predict_action_chunk(batch)
-            actions.extend(unnormalize_actions(predicted)[0, :8].detach().cpu().numpy())
+            actions.extend(unnormalize_actions(predicted, policy.normalization)[0, :8].detach().cpu().numpy())
         observation, _, _, info = env.step(actions.popleft())
         if task_oracle.get_task_info_for_set(start_info, info, {subtask}):
             history.complete_subtask(annotation)
@@ -180,8 +180,8 @@ def main():
                 f"peak_allocated_GiB={torch.cuda.max_memory_allocated(device) / 2**30:.3f}",
                 flush=True,
             )
-        processor = Processor(args.vlm_path, device)
-        history = SummaryHistory(policy.model.state_encoder.history_null_state)
+        processor = Processor(args.vlm_path, device, policy.normalization)
+        history = SummaryHistory(policy.model.state_encoder.history_null_state, policy.normalization)
         results = {}
         for offset in range(0, args.num_sequences, world_size):
             index = offset + rank

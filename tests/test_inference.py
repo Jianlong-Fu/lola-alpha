@@ -25,7 +25,7 @@ from export_checkpoint import export_checkpoint, normalize_name
 from lola_alpha.evaluation_utils import fnv1_32, seed_everything
 from lola_alpha.model import ActionEncoder, ActionModel, StateEncoder, load_policy
 from lola_alpha.processor import (
-    ACTION_MEAN, STATE_MEAN, Processor, SummaryHistory, append_empty_token,
+    ACTION_MEAN, ACTION_STD, STATE_MEAN, STATE_STD, NormalizationStats, Processor, SummaryHistory, append_empty_token,
     format_task, normalize_state, unnormalize_actions,
 )
 
@@ -88,6 +88,7 @@ class Environment:
 class CountingPolicy:
     def __init__(self):
         self.calls = 0
+        self.normalization = NormalizationStats()
 
     def predict_action_chunk(self, batch):
         self.calls += 1
@@ -188,6 +189,55 @@ class InferenceTests(unittest.TestCase):
         self.assertTrue(torch.equal(output[0, 0, :6], torch.tensor(ACTION_MEAN[:6])))
         self.assertTrue(torch.all(output[..., -1] == -1))
 
+    def test_checkpoint_normalization_metadata(self):
+        defaults = NormalizationStats()
+        for metadata in (None, {}, {"source_tag": "old"}, {"normalization": "{}"}):
+            self.assertEqual(NormalizationStats.from_metadata(metadata), defaults)
+        custom = {
+            "state_mean": [1.0] * 7, "state_std": [2.0] * 7,
+            "action_mean": [3.0] * 7, "action_std": [4.0] * 7,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            from safetensors import safe_open
+
+            path = Path(directory) / "model.safetensors"
+            save_file({"model.weight": torch.zeros(1)}, str(path), metadata={"normalization": json.dumps(custom)})
+            with safe_open(str(path), framework="pt") as checkpoint:
+                stats = NormalizationStats.from_metadata(checkpoint.metadata())
+        self.assertEqual(stats, NormalizationStats(**custom))
+        self.assertTrue(torch.equal(normalize_state(torch.ones(7), stats), torch.zeros(7)))
+        prediction = torch.ones(1, 16, 7, dtype=torch.bfloat16)
+        prediction[..., -1] = -1
+        actual = unnormalize_actions(prediction, stats)
+        self.assertTrue(torch.equal(actual[..., :6], torch.full((1, 16, 6), 7.0)))
+        self.assertTrue(torch.all(actual[..., -1] == -1))
+        history = SummaryHistory(normalize_state(torch.zeros(7), stats), stats)
+        history.begin_subtask(torch.ones(7))
+        history.record_nonterminal_state(torch.full((7,), 3.0))
+        history.complete_subtask("first")
+        history.begin_subtask(torch.ones(7))
+        batch = history.build("cpu")
+        torch.testing.assert_close(batch["hist_transition_states"][0, -2], torch.zeros(7), rtol=0, atol=0)
+        torch.testing.assert_close(batch["hist_transition_states"][0, -1], torch.ones(7), rtol=0, atol=0)
+        torch.testing.assert_close(batch["hist_task_states"][0, -1], torch.zeros(7), rtol=0, atol=0)
+        self.assertEqual(NormalizationStats(), defaults)
+        partial = NormalizationStats.from_metadata({"normalization": json.dumps({"state_mean": [1.0] * 7})})
+        self.assertEqual(partial.state_mean, (1.0,) * 7)
+        self.assertEqual((partial.state_std, partial.action_mean, partial.action_std), (STATE_STD, ACTION_MEAN, ACTION_STD))
+
+    def test_invalid_normalization_metadata(self):
+        for payload in ("not-json", "null", "[]", '{"typo": []}', '{"state_mean": null}'):
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                NormalizationStats.from_metadata({"normalization": payload})
+        for key in ("state_mean", "state_std", "action_mean", "action_std"):
+            for values in ([0.0] * 6, [[0.0] * 7], [float("nan")] * 7, [float("inf")] * 7):
+                with self.subTest(key=key, values=values), self.assertRaises(ValueError):
+                    NormalizationStats.from_metadata({"normalization": json.dumps({key: values})})
+        for key in ("state_std", "action_std"):
+            for values in ([0.0] * 7, [-1.0] * 7):
+                with self.subTest(key=key, values=values), self.assertRaises(ValueError):
+                    NormalizationStats.from_metadata({"normalization": json.dumps({key: values})})
+
     def test_single_item_processor(self):
         fake = types.SimpleNamespace(
             image_processor=types.SimpleNamespace(size={}),
@@ -212,6 +262,14 @@ class InferenceTests(unittest.TestCase):
         self.assertEqual(batch["observation.state"].shape, (1, 7))
         self.assertEqual(batch["hist_task_states"].shape, (1, 32, 7))
         self.assertEqual(batch["input_ids"].shape, batch["mm_token_type_ids"].shape)
+        stats = NormalizationStats(state_mean=(1.0,) * 7, state_std=(2.0,) * 7)
+        history = SummaryHistory(normalize_state(torch.zeros(7), stats), stats)
+        history.begin_subtask(torch.zeros(7))
+        with patch("transformers.AutoProcessor.from_pretrained", return_value=fake):
+            processor = Processor("unused", "cpu", stats)
+        batch = processor(Environment().get_obs(), "open drawer", history)
+        torch.testing.assert_close(batch["observation.state"], torch.full((1, 7), -0.5), rtol=0, atol=0)
+        torch.testing.assert_close(batch["hist_task_states"][:, -1], batch["observation.state"], rtol=0, atol=0)
 
     def test_rollout_chunk_and_success_boundary(self):
         env, policy = Environment(), CountingPolicy()
@@ -234,6 +292,20 @@ class InferenceTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertEqual(env.steps, 4)
         self.assertEqual(self.history.completed, ["first"])
+
+    def test_rollout_checkpoint_normalization(self):
+        env, policy = Environment(), CountingPolicy()
+        policy.normalization = NormalizationStats(
+            state_mean=(1.0,) * 7, state_std=(2.0,) * 7,
+            action_mean=(3.0,) * 7, action_std=(4.0,) * 7,
+        )
+        history = SummaryHistory(normalize_state(torch.zeros(7), policy.normalization), policy.normalization)
+        oracle = types.SimpleNamespace(get_task_info_for_set=lambda start, current, tasks: current["step"] == 2)
+        self.assertTrue(rollout(env, policy, lambda *args: {}, history, oracle, "task", "annotation", 20))
+        np.testing.assert_array_equal(np.stack(env.actions)[:, :6], [[3.0] * 6, [7.0] * 6])
+        self.assertEqual([action[-1] for action in env.actions], [0, 1])
+        torch.testing.assert_close(history.transition[0], torch.full((7,), -0.5), rtol=0, atol=0)
+        torch.testing.assert_close(history.transition[1], torch.zeros(7), rtol=0, atol=0)
 
     def test_calvin_sequence_generation(self):
         initial = {"led": 1, "lightbulb": 0}
@@ -358,6 +430,44 @@ class InferenceTests(unittest.TestCase):
                 self.assertEqual(restored[name].dtype, dtype)
                 torch.testing.assert_close(restored[name], value.to(dtype), rtol=0, atol=0)
 
+    def test_export_normalization(self):
+        from safetensors import safe_open
+
+        stats = NormalizationStats(
+            state_mean=(1.0,) * 7, state_std=(2.0,) * 7,
+            action_mean=(3.0,) * 7, action_std=(4.0,) * 7,
+        )
+        source = {
+            "module.policy.model.weight": torch.randn(2, 3),
+            "module.policy.model.state_encoder.history_null_state": torch.zeros(7),
+        }
+        fake = types.ModuleType("deepspeed.utils.zero_to_fp32")
+        fake.get_fp32_state_dict_from_zero_checkpoint = lambda *args, **kwargs: source
+        modules = {"deepspeed": types.ModuleType("deepspeed"), "deepspeed.utils": types.ModuleType("deepspeed.utils"),
+                   "deepspeed.utils.zero_to_fp32": fake}
+        with tempfile.TemporaryDirectory() as directory, patch.dict(sys.modules, modules):
+            output = Path(directory) / "model.safetensors"
+            stats_path = Path(directory) / "stats.json"
+            stats_path.write_text(json.dumps({
+                "observation.state": {"mean": stats.state_mean, "std": stats.state_std},
+                "action": {"mean": stats.action_mean, "std": stats.action_std},
+            }))
+            with self.assertRaisesRegex(ValueError, "history_null_state does not match"):
+                export_checkpoint(Path(directory) / "step_1", output, stats_path=stats_path)
+            self.assertFalse(output.exists())
+            source["module.policy.model.state_encoder.history_null_state"] = normalize_state(torch.zeros(7), stats)
+            export_checkpoint(Path(directory) / "step_1", output, stats_path=stats_path)
+            with safe_open(str(output), framework="pt") as checkpoint:
+                metadata = checkpoint.metadata()
+                self.assertEqual(NormalizationStats.from_metadata(metadata), stats)
+                self.assertEqual(metadata["source_tag"], "step_1")
+                self.assertEqual(len(metadata["normalization_source_sha256"]), 64)
+                for name, value in source.items():
+                    torch.testing.assert_close(checkpoint.get_tensor(normalize_name(name)), value, rtol=0, atol=0)
+            stats_path.write_text("{}")
+            with self.assertRaisesRegex(ValueError, "must contain observation.state/action"):
+                export_checkpoint(Path(directory) / "step_1", Path(directory) / "invalid.safetensors", stats_path=stats_path)
+
     def test_load_dtype_and_trained_vlm(self):
         class TinyModel(nn.Module):
             def __init__(self):
@@ -384,12 +494,26 @@ class InferenceTests(unittest.TestCase):
                 "transformers.models.cosmos3_omni.modeling_cosmos3_omni.Cosmos3OmniModel", TinyVLM,
             ), patch("transformers.AutoConfig.from_pretrained", return_value=types.SimpleNamespace()):
                 policy = load_policy(path, "unused", "cpu")
+                self.assertEqual(policy.normalization, NormalizationStats())
                 if torch.cuda.is_available():
                     cuda_policy = load_policy(path, "unused", "cuda:0")
                     self.assertEqual(cuda_policy.vlm.weight.device.type, "cuda")
                     torch.testing.assert_close(
                         cuda_policy.vlm.rotary_frequency.cpu(), policy.vlm.rotary_frequency, rtol=0, atol=0,
                     )
+                custom = {
+                    "state_mean": [1.0] * 7, "state_std": [2.0] * 7,
+                    "action_mean": [3.0] * 7, "action_std": [4.0] * 7,
+                }
+                save_file(weights, str(path), metadata={"normalization": json.dumps(custom)})
+                custom_policy = load_policy(path, "unused", "cpu")
+                self.assertEqual(custom_policy.normalization, NormalizationStats(**custom))
+                self.assertEqual(policy.normalization, NormalizationStats())
+                for name, value in policy.state_dict().items():
+                    torch.testing.assert_close(custom_policy.state_dict()[name], value, rtol=0, atol=0)
+                save_file(weights, str(path), metadata={"normalization": '{"state_std": [0, 0, 0, 0, 0, 0, 0]}'})
+                with self.assertRaisesRegex(ValueError, "standard deviations must be positive"):
+                    load_policy(path, "unused", "cpu")
                 invalid = dict(weights)
                 invalid["vlm.unexpected"] = torch.ones(1)
                 save_file(invalid, str(path))

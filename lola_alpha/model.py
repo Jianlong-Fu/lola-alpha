@@ -7,6 +7,7 @@ from torch import nn
 from torch.nn import functional as functional
 
 from .dit import ContextBridge, DiT
+from .processor import DEFAULT_NORMALIZATION, NormalizationStats
 
 
 class ActionEncoder(nn.Module):
@@ -195,10 +196,11 @@ class ActionModel(nn.Module):
 
 
 class Policy(nn.Module):
-    def __init__(self, model, vlm):
+    def __init__(self, model, vlm, normalization=DEFAULT_NORMALIZATION):
         super().__init__()
         self.model = model
         self.vlm = vlm
+        self.normalization = normalization
 
     @torch.no_grad()
     def predict_action_chunk(self, batch):
@@ -223,6 +225,7 @@ def load_policy(checkpoint_path, vlm_path, device):
     with torch.device("meta"):
         model = ActionModel()
     with safe_open(str(checkpoint_path), framework="pt", device="cpu") as weights:
+        normalization = NormalizationStats.from_metadata(weights.metadata())
         keys = set(weights.keys())
         unknown = {name for name in keys if not name.startswith(("model.", "vlm."))}
         if unknown:
@@ -267,4 +270,4 @@ def load_policy(checkpoint_path, vlm_path, device):
                     if value.shape != target.shape:
                         raise RuntimeError(f"VLM tensor shape mismatch: {name}")
                     target.copy_(value)
-    return Policy(model, vlm).eval()
+    return Policy(model, vlm, normalization).eval()
